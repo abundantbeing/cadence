@@ -8,11 +8,59 @@ import unittest
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import activity_board
 from activity_board import day, summary
+
+_SCHEMA_SQL = """
+CREATE TABLE sessions (
+  id TEXT PRIMARY KEY, source TEXT, model TEXT, billing_provider TEXT,
+  parent_session_id TEXT, started_at REAL, title TEXT,
+  input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+  cache_read_tokens INTEGER DEFAULT 0, cache_write_tokens INTEGER DEFAULT 0,
+  reasoning_tokens INTEGER DEFAULT 0
+);
+CREATE TABLE messages (
+  session_id TEXT, role TEXT, timestamp REAL
+);
+CREATE TABLE session_model_usage (
+  session_id TEXT, model TEXT, billing_provider TEXT,
+  input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
+  cache_read_tokens INTEGER DEFAULT 0, cache_write_tokens INTEGER DEFAULT 0,
+  reasoning_tokens INTEGER DEFAULT 0
+);
+"""
 
 
 def _stamp(day: date, hour: int = 12, minute: int = 0) -> float:
     return datetime(day.year, day.month, day.day, hour, minute).timestamp()
+
+
+def _insert_session(conn, sid: str, source: str, model: str, started: date, tokens: int, parent: str | None = None) -> None:
+    conn.execute(
+        """INSERT INTO sessions
+           (id, source, model, billing_provider, parent_session_id, started_at, title, input_tokens, output_tokens)
+           VALUES (?, ?, ?, 'test', ?, ?, ?, ?, 0)""",
+        (sid, source, model, parent, _stamp(started), sid, tokens),
+    )
+
+
+def _insert_message(conn, sid: str, when: datetime) -> None:
+    conn.execute("INSERT INTO messages VALUES (?, 'user', ?)", (sid, when.timestamp()))
+
+
+class _Store:
+    """One profile's state.db in a test."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.conn = sqlite3.connect(path)
+        self.conn.executescript(_SCHEMA_SQL)
+
+    def _session(self, *args, **kwargs) -> None:
+        _insert_session(self.conn, *args, **kwargs)
+
+    def _message(self, sid: str, when: datetime) -> None:
+        _insert_message(self.conn, sid, when)
 
 
 class ActivityBoardTests(unittest.TestCase):
@@ -20,43 +68,17 @@ class ActivityBoardTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.path = Path(self.tmp.name) / "state.db"
         self.conn = sqlite3.connect(self.path)
-        self.conn.executescript(
-            """
-            CREATE TABLE sessions (
-              id TEXT PRIMARY KEY, source TEXT, model TEXT, billing_provider TEXT,
-              parent_session_id TEXT, started_at REAL, title TEXT,
-              input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
-              cache_read_tokens INTEGER DEFAULT 0, cache_write_tokens INTEGER DEFAULT 0,
-              reasoning_tokens INTEGER DEFAULT 0
-            );
-            CREATE TABLE messages (
-              session_id TEXT, role TEXT, timestamp REAL
-            );
-            CREATE TABLE session_model_usage (
-              session_id TEXT, model TEXT, billing_provider TEXT,
-              input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
-              cache_read_tokens INTEGER DEFAULT 0, cache_write_tokens INTEGER DEFAULT 0,
-              reasoning_tokens INTEGER DEFAULT 0
-            );
-            """
-        )
+        self.conn.executescript(_SCHEMA_SQL)
 
     def tearDown(self) -> None:
         self.conn.close()
         self.tmp.cleanup()
 
     def _session(self, sid: str, source: str, model: str, started: date, tokens: int, parent: str | None = None) -> None:
-        self.conn.execute(
-            """INSERT INTO sessions
-               (id, source, model, billing_provider, parent_session_id, started_at, title, input_tokens, output_tokens)
-               VALUES (?, ?, ?, 'test', ?, ?, ?, ?, 0)""",
-            (sid, source, model, parent, _stamp(started), sid, tokens),
-        )
+        _insert_session(self.conn, sid, source, model, started, tokens, parent)
 
     def _message(self, sid: str, when: datetime) -> None:
-        self.conn.execute(
-            "INSERT INTO messages VALUES (?, 'user', ?)", (sid, when.timestamp())
-        )
+        _insert_message(self.conn, sid, when)
 
     def test_resumed_chat_counts_the_later_day(self) -> None:
         today = date.today()
@@ -138,6 +160,133 @@ class ActivityBoardTests(unittest.TestCase):
         report = summary(path=self.path, today=today)
         self.assertEqual(report["streaks"]["longest"], 2)
         self.assertEqual(report["streaks"]["current"], 2)
+
+
+
+class AllProfilesTests(unittest.TestCase):
+    """``scope='all'`` merges every profile's store read-only."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.stores: list[tuple[str, Path]] = []
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _store(self, name: str) -> _Store:
+        store = _Store(self.root / f"{name}.db")
+        self.stores.append((name, store.path))
+        return store
+
+    def test_profiles_merge_and_keep_their_own_ids(self) -> None:
+        today = date.today()
+        noon = datetime(today.year, today.month, today.day, 12, 0)
+        for name, tokens in (("alpha", 100), ("beta", 300)):
+            store = self._store(name)
+            store._session("same-id", "desktop", "model-a", today, tokens)
+            store._message("same-id", noon)
+            store.conn.commit()
+            store.conn.close()
+        report = summary(scope="all", stores=self.stores, today=today)
+        self.assertEqual(report["scope"], "all")
+        self.assertEqual(report["included_profiles"], ["alpha", "beta"])
+        self.assertEqual(report["totals"]["sessions"], 2)
+        self.assertEqual(report["totals"]["tokens"], 400)
+        self.assertEqual(report["streaks"]["current"], 1)
+        self.assertEqual(
+            [(row["profile"], row["sessions"], row["tokens"]) for row in report["profiles"]],
+            [("beta", 1, 300), ("alpha", 1, 100)],
+        )
+        chosen = day(today.isoformat(), scope="all", stores=self.stores)
+        self.assertEqual(sorted(row["profile"] for row in chosen["sessions"]), ["alpha", "beta"])
+        self.assertEqual(len({row["id"] for row in chosen["sessions"]}), 2)
+
+    def test_agent_only_days_do_not_keep_a_streak(self) -> None:
+        today = date.today()
+        store = self._store("worker")
+        store._session("card", "kanban", "model-a", today, 70)
+        store._message("card", datetime(today.year, today.month, today.day, 9, 0))
+        store._session("child", "subagent", "model-a", today, 30)
+        store._message("child", datetime(today.year, today.month, today.day, 9, 5))
+        store.conn.commit()
+        store.conn.close()
+        report = summary(scope="all", stores=self.stores, today=today)
+        self.assertEqual(report["streaks"]["current"], 0)
+        self.assertEqual(report["weeks"]["this"]["days"], 1)
+        self.assertEqual(report["totals"]["tokens"], 100)
+        self.assertEqual(report["cells"][-7 + today.weekday()]["sessions"], 2)
+
+    def test_unreadable_store_is_skipped(self) -> None:
+        today = date.today()
+        store = self._store("good")
+        store._session("chat", "cli", "model-a", today, 5)
+        store._message("chat", datetime(today.year, today.month, today.day, 9, 0))
+        store.conn.commit()
+        store.conn.close()
+        broken = self.root / "broken.db"
+        sqlite3.connect(broken).execute("CREATE TABLE unrelated (x)").connection.close()
+        self.stores.append(("broken", broken))
+        report = summary(scope="all", stores=self.stores, today=today)
+        self.assertEqual(report["included_profiles"], ["good"])
+
+    def test_profile_tokens_match_totals_without_messages(self) -> None:
+        today = date.today()
+        talking = self._store("talking")
+        talking._session("chat", "cli", "model-a", today, 100)
+        talking._message("chat", datetime(today.year, today.month, today.day, 9, 0))
+        talking.conn.commit()
+        talking.conn.close()
+        quiet = self._store("quiet")
+        quiet._session("chat", "cli", "model-a", today, 100)
+        quiet.conn.commit()
+        quiet.conn.close()
+        report = summary(scope="all", stores=self.stores, today=today)
+        self.assertEqual(report["totals"]["tokens"], 200)
+        self.assertEqual(sum(row["tokens"] for row in report["profiles"]), 200)
+
+    def test_empty_window_has_an_empty_agent_list(self) -> None:
+        today = date.today()
+        old = today - timedelta(days=100)
+        store = self._store("old")
+        store._session("chat", "cli", "model-a", old, 100)
+        store._message("chat", datetime(old.year, old.month, old.day, 9, 0))
+        store.conn.commit()
+        store.conn.close()
+        report = summary(scope="all", stores=self.stores, today=today)
+        self.assertEqual(report["spans"]["30"]["profiles"], [])
+        self.assertEqual(report["spans"]["all"]["profiles"][0]["tokens"], 100)
+
+    def test_bad_timestamps_in_one_store_do_not_break_the_report(self) -> None:
+        today = date.today()
+        good = self._store("good")
+        good._session("chat", "cli", "model-a", today, 5)
+        good._message("chat", datetime(today.year, today.month, today.day, 9, 0))
+        good.conn.commit()
+        good.conn.close()
+        odd = self._store("odd")
+        odd.conn.execute("INSERT INTO sessions (id, source, started_at, input_tokens) VALUES ('x', 'cli', 'invalid', 7)")
+        odd.conn.execute("INSERT INTO messages VALUES ('x', 'user', 'later')")
+        odd.conn.commit()
+        odd.conn.close()
+        report = summary(scope="all", stores=self.stores, today=today)
+        self.assertEqual(report["totals"]["tokens"], 12)
+        self.assertEqual(report["streaks"]["current"], 1)
+
+    def test_profile_discovery_honours_exclusions(self) -> None:
+        (self.root / "state.db").touch()
+        for name in ("alpha", "private", "no-config"):
+            home = self.root / "profiles" / name
+            home.mkdir(parents=True)
+            (home / "state.db").touch()
+            if name != "no-config":
+                (home / "config.yaml").touch()
+        names = [name for name, _ in activity_board.profile_stores(exclude={"private"}, root=self.root)]
+        self.assertEqual(names, ["default", "alpha"])
+
+    def test_scope_is_validated(self) -> None:
+        with self.assertRaises(activity_board.ActivityError):
+            summary(scope="everything", stores=self.stores)
 
 
 if __name__ == "__main__":
