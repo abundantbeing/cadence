@@ -23,7 +23,8 @@ EXCLUDED_SOURCES = frozenset({
     "cron", "tool", "oneshot", "fallback-verification", "haiku55-sdk-health", "unknown",
 })
 TOKEN_COLS = (
-    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens",
+    # reasoning_tokens is the thinking part of output_tokens, so it is not added again.
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
 )
 
 

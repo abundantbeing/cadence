@@ -128,6 +128,35 @@ class ActivityBoardTests(unittest.TestCase):
         chosen = day(today.isoformat(), path=self.path)
         self.assertEqual(len(chosen["sessions"]), 1)
 
+    def test_reasoning_tokens_are_not_counted_twice(self) -> None:
+        # Hermes stores reasoning_tokens as the thinking part of output_tokens
+        # (completion_tokens_details.reasoning_tokens), so a total adds output
+        # once and never adds reasoning on top of it.
+        today = date.today()
+        self.conn.execute(
+            """INSERT INTO sessions
+               (id, source, model, billing_provider, started_at, title,
+                input_tokens, output_tokens, reasoning_tokens)
+               VALUES ('chat', 'desktop', 'model-a', 'test', ?, 'chat', 40, 100, 60),
+                      ('solo', 'desktop', 'model-b', 'test', ?, 'solo', 0, 10, 4)""",
+            (_stamp(today), _stamp(today)),
+        )
+        self.conn.execute(
+            """INSERT INTO session_model_usage
+               (session_id, model, billing_provider, input_tokens, output_tokens, reasoning_tokens)
+               VALUES ('chat', 'model-a', 'test', 40, 100, 60)"""
+        )
+        self._message("chat", datetime(today.year, today.month, today.day, 9, 0))
+        self._message("solo", datetime(today.year, today.month, today.day, 10, 0))
+        self.conn.commit()
+        report = summary(path=self.path, today=today)
+        self.assertEqual(report["totals"]["tokens"], 150)
+        self.assertEqual(report["spans"]["30"]["tokens"], 150)
+        self.assertEqual({row["model"]: row["tokens"] for row in report["models"]}, {"model-a": 140, "model-b": 10})
+        self.assertEqual({row["model"]: row["tokens"] for row in report["spans"]["30"]["models"]}, {"model-a": 140, "model-b": 10})
+        chosen = day(today.isoformat(), path=self.path)
+        self.assertEqual({row["id"]: row["tokens"] for row in chosen["sessions"]}, {"chat": 140, "solo": 10})
+
     def test_gap_day_breaks_the_longest_run(self) -> None:
         today = date.today()
         self._session("chat", "cli", "model-a", today - timedelta(days=4), 5)
