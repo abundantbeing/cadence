@@ -33,7 +33,8 @@ EXCLUDED_SOURCES = frozenset({
 # but a day with only this kind of session does not keep a personal streak.
 STREAK_EXCLUDED_SOURCES = frozenset({"kanban", "subagent"})
 TOKEN_COLS = (
-    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens",
+    # reasoning_tokens is the thinking part of output_tokens, so it is not added again.
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
 )
 SCOPES = ("profile", "all")
 _SESSION_FIELDS = (
