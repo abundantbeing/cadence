@@ -1,0 +1,14 @@
+{
+  "name": "cadence-desktop-test-harness",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node run-harness.mjs"
+  },
+  "dependencies": {
+    "@testing-library/react": "^16.0.1",
+    "jsdom": "^25.0.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  }
+}

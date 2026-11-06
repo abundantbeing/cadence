@@ -1,5 +1,5 @@
 name: cadence
-version: "1.0.0"
+version: "1.1.0"
 description: "Local usage page for Hermes. Streaks follow days a chat was actually used, model totals follow each model in a chat, and the heatmap is computed on this machine. Read-only. No network calls."
 author: Komet Studios
 license: MIT
