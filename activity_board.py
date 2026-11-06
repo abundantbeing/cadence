@@ -42,6 +42,38 @@ _SESSION_FIELDS = (
 )
 _USAGE_FIELDS = ("session_id", "model", "billing_provider", *TOKEN_COLS)
 
+# Hermes stores Unix seconds; some bad rows use milliseconds or values datetime cannot represent.
+_EPOCH_SECOND_MIN = 0.0
+_EPOCH_SECOND_MAX = 4102444800.0  # 2100-01-01 UTC, generous upper bound for activity views
+
+
+def _normalize_unix_seconds(raw: Optional[float]) -> Optional[float]:
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value != value or value in (float("inf"), float("-inf")):
+        return None
+    if value > _EPOCH_SECOND_MAX * 1000:
+        return None
+    if value > _EPOCH_SECOND_MAX:
+        value = value / 1000.0
+    if value < _EPOCH_SECOND_MIN or value > _EPOCH_SECOND_MAX:
+        return None
+    return value
+
+
+def _day_iso_from_started(raw: Optional[float]) -> Optional[str]:
+    seconds = _normalize_unix_seconds(raw if isinstance(raw, (int, float)) else None)
+    if seconds is None:
+        return None
+    try:
+        return date.fromtimestamp(seconds).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
 
 class ActivityError(Exception):
     """A problem the user can act on."""
@@ -145,30 +177,69 @@ def _merged(stores: list[tuple[str, Path]]) -> tuple[sqlite3.Connection, list[st
                 continue
             has_parent = "parent_session_id" in session_cols
             # A non-numeric timestamp in one profile must not break the merged report.
-            started = "CASE WHEN typeof(s.started_at) IN ('integer', 'real') THEN s.started_at END"
+            raw_started = "CASE WHEN typeof(s.started_at) IN ('integer', 'real') THEN s.started_at END"
+            started_norm = (
+                f"CASE WHEN ({raw_started}) IS NULL THEN NULL "
+                f"WHEN ({raw_started}) > {_EPOCH_SECOND_MAX} AND ({raw_started}) <= {_EPOCH_SECOND_MAX} * 1000 "
+                f"THEN ({raw_started}) / 1000.0 ELSE ({raw_started}) END"
+            )
+            started_ok = (
+                f"({started_norm}) IS NOT NULL "
+                f"AND ({started_norm}) >= {_EPOCH_SECOND_MIN} "
+                f"AND ({started_norm}) <= {_EPOCH_SECOND_MAX}"
+            )
+            raw_ts = "CASE WHEN typeof(m.timestamp) IN ('integer', 'real') THEN m.timestamp END"
+            ts_norm = (
+                f"CASE WHEN ({raw_ts}) IS NULL THEN NULL "
+                f"WHEN ({raw_ts}) > {_EPOCH_SECOND_MAX} AND ({raw_ts}) <= {_EPOCH_SECOND_MAX} * 1000 "
+                f"THEN ({raw_ts}) / 1000.0 ELSE ({raw_ts}) END"
+            )
+            ts_ok = (
+                f"({ts_norm}) IS NOT NULL "
+                f"AND ({ts_norm}) >= {_EPOCH_SECOND_MIN} "
+                f"AND ({ts_norm}) <= {_EPOCH_SECOND_MAX}"
+            )
+            has_usable_messages = f"EXISTS (SELECT 1 FROM src.messages m WHERE m.session_id = s.id AND {ts_ok})"
+            token_parts = [
+                f"ABS(COALESCE(s.{col}, 0))"
+                for col in TOKEN_COLS
+                if col in session_cols
+            ]
+            token_sum = "+".join(token_parts) if token_parts else "0"
+            legacy_bad_start = (
+                f"(typeof(s.started_at) NOT IN ('integer', 'real') AND ({token_sum}) > 0)"
+            )
+            keep_session = f"({has_usable_messages}) OR ({started_ok}) OR ({legacy_bad_start})"
             parent = "CASE WHEN s.parent_session_id IS NULL THEN NULL ELSE ? || s.parent_session_id END"
             conn.execute(
                 f"""INSERT INTO sessions
                     SELECT ? || s.id, {_select_list(session_cols, _SESSION_FIELDS[1:4], "s")},
-                           {parent if has_parent else "NULL"}, {started},
+                           {parent if has_parent else "NULL"},
+                           CASE WHEN {started_ok} THEN {started_norm} ELSE NULL END,
                            {_select_list(session_cols, _SESSION_FIELDS[6:], "s")}, ?
-                    FROM src.sessions s""",
+                    FROM src.sessions s WHERE {keep_session}""",
                 (prefix, prefix, name) if has_parent else (prefix, name),
             )
             conn.execute(
-                "INSERT INTO messages SELECT ? || session_id, timestamp FROM src.messages"
-                " WHERE typeof(timestamp) IN ('integer', 'real')",
+                f"""INSERT INTO messages SELECT ? || m.session_id, {ts_norm}
+                    FROM src.messages m
+                    JOIN src.sessions s ON s.id = m.session_id
+                    WHERE {ts_ok} AND {keep_session}""",
                 (prefix,),
             )
             usage_cols = {row[1] for row in conn.execute("PRAGMA src.table_info(session_model_usage)")}
             if "session_id" in usage_cols:
                 rest = _select_list(usage_cols, _USAGE_FIELDS[1:], "u")
                 conn.execute(
-                    f"INSERT INTO session_model_usage SELECT ? || u.session_id, {rest} FROM src.session_model_usage u",
+                    f"""INSERT INTO session_model_usage SELECT ? || u.session_id, {rest}
+                        FROM src.session_model_usage u
+                        JOIN src.sessions s ON s.id = u.session_id
+                        WHERE {keep_session}""",
                     (prefix,),
                 )
             conn.commit()
-            included.append(name)
+            if conn.execute("SELECT 1 FROM sessions WHERE profile = ?", (name,)).fetchone():
+                included.append(name)
         except sqlite3.Error:
             conn.rollback()
         finally:
@@ -346,8 +417,9 @@ def summary(
         amount = float(row["tokens"] or 0)
         lifetime += amount
         days = sorted(by_session_days.get(row["id"], set()))
-        if not days and row["started_at"]:
-            days = [date.fromtimestamp(row["started_at"]).isoformat()]
+        fallback = _day_iso_from_started(row["started_at"])
+        if not days and fallback:
+            days = [fallback]
         shares = _allocate(amount, days)
         session_shares[row["id"]] = shares
         for day, share in shares.items():
@@ -520,8 +592,9 @@ def _spans(
         if amount <= 0:
             continue
         days = sorted(by_session_days.get(sid, set()))
-        if not days and row["started_at"]:
-            days = [date.fromtimestamp(row["started_at"]).isoformat()]
+        fallback = _day_iso_from_started(row["started_at"])
+        if not days and fallback:
+            days = [fallback]
         if not days:
             continue
         share = amount / len(days)
@@ -693,7 +766,9 @@ def _longest_stretch(conn: sqlite3.Connection, params: tuple) -> Optional[dict[s
         params,
     )
     for row in query:
-        stamp = float(row["timestamp"])
+        stamp = _normalize_unix_seconds(float(row["timestamp"]))
+        if stamp is None:
+            continue
         if row["id"] != current_id:
             consider()
             current_id = row["id"]

@@ -31,6 +31,9 @@ function parseCli(output) {
 }
 
 async function activity(argv) {
+  if (typeof globalThis.__cadenceActivityImpl === 'function') {
+    return globalThis.__cadenceActivityImpl(argv)
+  }
   const args = ['cadence', ...argv, '--json']
   let response
   if (typeof host.requestProfile === 'function' && typeof host.profileRoutes === 'function') {
@@ -246,6 +249,18 @@ function saveView(key, value) {
 
 const SCOPE_KEY = 'hermes.cadence.scope'
 const SCOPES = [['all', 'All profiles'], ['profile', 'This profile']]
+const SCOPE_EVENT = 'hermes.cadence.scope-change'
+
+let scopeEpoch = 0
+
+function bumpScopeEpoch() {
+  scopeEpoch += 1
+  try {
+    window.dispatchEvent(new CustomEvent(SCOPE_EVENT, { detail: { epoch: scopeEpoch } }))
+  } catch {
+    /* ignore */
+  }
+}
 
 // null follows plugins.entries.cadence.settings.scope; a click pins a choice on this device.
 function storedScope() {
@@ -255,6 +270,31 @@ function storedScope() {
   } catch {
     return null
   }
+}
+
+function useDeviceScope(initial) {
+  const [scope, setScopeState] = useState(initial)
+  const [epoch, setEpoch] = useState(0)
+  useEffect(() => {
+    const sync = () => {
+      setScopeState(storedScope())
+      setEpoch(scopeEpoch)
+    }
+    const onStorage = event => {
+      if (event.key === SCOPE_KEY || event.key === null) sync()
+    }
+    window.addEventListener('storage', onStorage)
+    window.addEventListener(SCOPE_EVENT, sync)
+    return () => {
+      window.removeEventListener('storage', onStorage)
+      window.removeEventListener(SCOPE_EVENT, sync)
+    }
+  }, [])
+  const setScope = next => {
+    setScopeState(next)
+    bumpScopeEpoch()
+  }
+  return [scope, setScope, epoch]
 }
 
 function scopeArgs(scope) {
@@ -470,7 +510,7 @@ function ActivityPage() {
   const [modelView, setModelView] = useState(() => storedView('hermes.activity.models'))
   const [placeView, setPlaceView] = useState(() => storedView('hermes.activity.places'))
   const [agentView, setAgentView] = useState(() => storedView('hermes.cadence.agents'))
-  const [scope, setScope] = useState(storedScope)
+  const [scope, setScope] = useDeviceScope(storedScope())
   const report = useQuery({
     queryKey: ['cadence', 'summary', scope],
     queryFn: () => activity(['summary', ...scopeArgs(scope)]),
@@ -490,11 +530,25 @@ function ActivityPage() {
       children: [
         jsx('div', { className: 'text-foreground', children: 'Activity could not load' }),
         jsx('div', { className: 'text-(--ui-text-tertiary)', children: report.error.message }),
-        jsx(Button, { size: 'xs', variant: 'text', onClick: () => void report.refetch(), children: 'Retry' }),
-        scope === 'all' ? jsx(Button, {
+        jsxs('div', {
+          className: 'flex flex-wrap items-center gap-3',
+          children: [
+            jsx(Button, { size: 'xs', variant: 'text', onClick: () => void report.refetch(), children: 'Retry' }),
+            jsx('div', {
+              className: 'flex gap-3 text-[0.72rem]',
+              children: SCOPES.map(([id, label]) => jsx('button', {
+                type: 'button',
+                className: id === (scope || 'all') ? 'text-foreground' : 'text-(--ui-text-tertiary)',
+                onClick: () => { saveView(SCOPE_KEY, id); setScope(id) },
+                children: label
+              }, id))
+            })
+          ]
+        }),
+        scope !== 'profile' ? jsx(Button, {
           size: 'xs',
           variant: 'text',
-          onClick: () => { setScope('profile'); saveView(SCOPE_KEY, 'profile') },
+          onClick: () => { saveView(SCOPE_KEY, 'profile'); setScope('profile') },
           children: 'Show this profile only'
         }) : null
       ]
@@ -536,7 +590,7 @@ function ActivityPage() {
                 children: SCOPES.map(([id, label]) => jsx('button', {
                   type: 'button',
                   className: id === (data.scope || 'profile') ? 'text-foreground' : 'text-(--ui-text-tertiary)',
-                  onClick: () => { setScope(id); setSelected(null); saveView(SCOPE_KEY, id) },
+                  onClick: () => { saveView(SCOPE_KEY, id); setScope(id); setSelected(null) },
                   children: label
                 }, id))
               }),
@@ -648,9 +702,9 @@ function ActivityPage() {
 }
 
 function StatusChip() {
-  const scope = storedScope()
+  const [scope, , epoch] = useDeviceScope(storedScope())
   const report = useQuery({
-    queryKey: ['cadence', 'summary', scope],
+    queryKey: ['cadence', 'summary', scope, epoch],
     queryFn: () => activity(['summary', ...scopeArgs(scope)]),
     staleTime: 180000
   })
@@ -663,7 +717,7 @@ function StatusChip() {
   })
 }
 
-export default {
+const cadencePlugin = {
   id: ID,
   name: 'Cadence',
   register(ctx) {
@@ -687,3 +741,13 @@ export default {
     ctx.register({ id: 'statusbar', area: STATUSBAR_AREAS.right, order: 120, render: () => jsx(StatusChip, {}) })
   }
 }
+
+export default cadencePlugin
+
+const _harness =
+  typeof process !== 'undefined' &&
+  process.env &&
+  process.env.CADENCE_TEST_HARNESS === '1'
+export const __cadenceHarness = _harness
+  ? { ActivityPage, StatusChip, SCOPE_KEY, storedScope, scopeArgs }
+  : undefined

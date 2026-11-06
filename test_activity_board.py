@@ -302,6 +302,25 @@ class AllProfilesTests(unittest.TestCase):
         self.assertEqual(report["totals"]["tokens"], 12)
         self.assertEqual(report["streaks"]["current"], 1)
 
+    def test_out_of_range_numeric_started_at_does_not_break_merged_summary(self) -> None:
+        today = date.today()
+        good = self._store("good")
+        good._session("chat", "cli", "model-a", today, 40)
+        good._message("chat", datetime(today.year, today.month, today.day, 9, 0))
+        good.conn.commit()
+        good.conn.close()
+        bad = self._store("bad")
+        bad.conn.execute(
+            "INSERT INTO sessions (id, source, started_at, input_tokens) VALUES ('ghost', 'cli', ?, 10)",
+            (1e15,),
+        )
+        bad.conn.commit()
+        bad.conn.close()
+        report = summary(scope="all", stores=self.stores, today=today)
+        self.assertEqual(report["included_profiles"], ["good"])
+        self.assertEqual(report["totals"]["tokens"], 40)
+        self.assertEqual(report["streaks"]["current"], 1)
+
     def test_profile_discovery_honours_exclusions(self) -> None:
         (self.root / "state.db").touch()
         for name in ("alpha", "private", "no-config"):
