@@ -236,7 +236,7 @@ def _merged(stores: list[tuple[str, Path]]) -> tuple[sqlite3.Connection, list[st
                 f"({keep_self}) OR EXISTS ("
                 f"SELECT 1 FROM src.sessions c WHERE c.parent_session_id = s.id AND ({keep_child})"
                 f")"
-            )
+            ) if has_parent else keep_self
             parent = "CASE WHEN s.parent_session_id IS NULL THEN NULL ELSE ? || s.parent_session_id END"
             conn.execute(
                 f"""INSERT INTO sessions

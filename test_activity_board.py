@@ -336,6 +336,29 @@ class AllProfilesTests(unittest.TestCase):
         with self.assertRaises(activity_board.ActivityError):
             summary(scope="everything", stores=self.stores)
 
+    def test_store_without_parent_session_id_is_included(self) -> None:
+        today = date.today()
+        legacy_path = self.root / "legacy.db"
+        conn = sqlite3.connect(legacy_path)
+        conn.executescript(
+            """CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY, source TEXT, started_at REAL, input_tokens INTEGER DEFAULT 0
+               );
+               CREATE TABLE messages (session_id TEXT, role TEXT, timestamp REAL);"""
+        )
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, input_tokens) VALUES (?, 'cli', ?, ?)",
+            ("chat", _stamp(today), 50),
+        )
+        conn.execute("INSERT INTO messages VALUES (?, 'user', ?)", ("chat", _stamp(today)))
+        conn.commit()
+        conn.close()
+        self.stores.append(("legacy", legacy_path))
+        report = summary(scope="all", stores=self.stores, today=today)
+        self.assertEqual(report["included_profiles"], ["legacy"])
+        self.assertEqual(report["totals"]["tokens"], 50)
+        self.assertEqual(report["streaks"]["current"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
