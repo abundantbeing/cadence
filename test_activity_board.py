@@ -317,7 +317,7 @@ class AllProfilesTests(unittest.TestCase):
         bad.conn.commit()
         bad.conn.close()
         report = summary(scope="all", stores=self.stores, today=today)
-        self.assertEqual(report["included_profiles"], ["good"])
+        self.assertEqual(report["included_profiles"], ["good", "bad"])
         self.assertEqual(report["totals"]["tokens"], 40)
         self.assertEqual(report["streaks"]["current"], 1)
 

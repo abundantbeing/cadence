@@ -209,7 +209,34 @@ def _merged(stores: list[tuple[str, Path]]) -> tuple[sqlite3.Connection, list[st
             legacy_bad_start = (
                 f"(typeof(s.started_at) NOT IN ('integer', 'real') AND ({token_sum}) > 0)"
             )
-            keep_session = f"({has_usable_messages}) OR ({started_ok}) OR ({legacy_bad_start})"
+            keep_self = f"({has_usable_messages}) OR ({started_ok}) OR ({legacy_bad_start})"
+            raw_started_c = "CASE WHEN typeof(c.started_at) IN ('integer', 'real') THEN c.started_at END"
+            started_norm_c = (
+                f"CASE WHEN ({raw_started_c}) IS NULL THEN NULL "
+                f"WHEN ({raw_started_c}) > {_EPOCH_SECOND_MAX} AND ({raw_started_c}) <= {_EPOCH_SECOND_MAX} * 1000 "
+                f"THEN ({raw_started_c}) / 1000.0 ELSE ({raw_started_c}) END"
+            )
+            started_ok_c = (
+                f"({started_norm_c}) IS NOT NULL "
+                f"AND ({started_norm_c}) >= {_EPOCH_SECOND_MIN} "
+                f"AND ({started_norm_c}) <= {_EPOCH_SECOND_MAX}"
+            )
+            has_usable_messages_c = f"EXISTS (SELECT 1 FROM src.messages m WHERE m.session_id = c.id AND {ts_ok})"
+            token_parts_c = [
+                f"ABS(COALESCE(c.{col}, 0))"
+                for col in TOKEN_COLS
+                if col in session_cols
+            ]
+            token_sum_c = "+".join(token_parts_c) if token_parts_c else "0"
+            legacy_bad_start_c = (
+                f"(typeof(c.started_at) NOT IN ('integer', 'real') AND ({token_sum_c}) > 0)"
+            )
+            keep_child = f"({has_usable_messages_c}) OR ({started_ok_c}) OR ({legacy_bad_start_c})"
+            keep_session = (
+                f"({keep_self}) OR EXISTS ("
+                f"SELECT 1 FROM src.sessions c WHERE c.parent_session_id = s.id AND ({keep_child})"
+                f")"
+            )
             parent = "CASE WHEN s.parent_session_id IS NULL THEN NULL ELSE ? || s.parent_session_id END"
             conn.execute(
                 f"""INSERT INTO sessions
@@ -238,8 +265,7 @@ def _merged(stores: list[tuple[str, Path]]) -> tuple[sqlite3.Connection, list[st
                     (prefix,),
                 )
             conn.commit()
-            if conn.execute("SELECT 1 FROM sessions WHERE profile = ?", (name,)).fetchone():
-                included.append(name)
+            included.append(name)
         except sqlite3.Error:
             conn.rollback()
         finally:
@@ -761,14 +787,18 @@ def _longest_stretch(conn: sqlite3.Connection, params: tuple) -> Optional[dict[s
             FROM messages m
             JOIN sessions s ON s.id = m.session_id
             LEFT JOIN sessions p ON p.id = s.parent_session_id
-            WHERE m.timestamp IS NOT NULL AND {personal}
-            ORDER BY s.id, m.timestamp""",
+            WHERE m.timestamp IS NOT NULL AND {personal}""",
         params,
     )
+    rows = []
     for row in query:
         stamp = _normalize_unix_seconds(float(row["timestamp"]))
         if stamp is None:
             continue
+        rows.append((row["id"], row["title"], row["source"], stamp))
+    rows.sort(key=lambda item: (item[0], item[3]))
+    for session_id, title_val, source_val, stamp in rows:
+        row = {"id": session_id, "title": title_val, "source": source_val, "timestamp": stamp}
         if row["id"] != current_id:
             consider()
             current_id = row["id"]

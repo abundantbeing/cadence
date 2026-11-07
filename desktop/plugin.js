@@ -253,10 +253,10 @@ const SCOPE_EVENT = 'hermes.cadence.scope-change'
 
 let scopeEpoch = 0
 
-function bumpScopeEpoch() {
+function bumpScopeEpoch(scope) {
   scopeEpoch += 1
   try {
-    window.dispatchEvent(new CustomEvent(SCOPE_EVENT, { detail: { epoch: scopeEpoch } }))
+    window.dispatchEvent(new CustomEvent(SCOPE_EVENT, { detail: { epoch: scopeEpoch, scope } }))
   } catch {
     /* ignore */
   }
@@ -276,12 +276,17 @@ function useDeviceScope(initial) {
   const [scope, setScopeState] = useState(initial)
   const [epoch, setEpoch] = useState(0)
   useEffect(() => {
-    const sync = () => {
-      setScopeState(storedScope())
+    const sync = event => {
+      const chosen = event?.detail?.scope
+      if (chosen !== undefined && SCOPES.some(([id]) => id === chosen)) {
+        setScopeState(chosen)
+      } else {
+        setScopeState(storedScope())
+      }
       setEpoch(scopeEpoch)
     }
     const onStorage = event => {
-      if (event.key === SCOPE_KEY || event.key === null) sync()
+      if (event.key === SCOPE_KEY || event.key === null) sync(event)
     }
     window.addEventListener('storage', onStorage)
     window.addEventListener(SCOPE_EVENT, sync)
@@ -292,7 +297,7 @@ function useDeviceScope(initial) {
   }, [])
   const setScope = next => {
     setScopeState(next)
-    bumpScopeEpoch()
+    bumpScopeEpoch(next)
   }
   return [scope, setScope, epoch]
 }
@@ -510,9 +515,9 @@ function ActivityPage() {
   const [modelView, setModelView] = useState(() => storedView('hermes.activity.models'))
   const [placeView, setPlaceView] = useState(() => storedView('hermes.activity.places'))
   const [agentView, setAgentView] = useState(() => storedView('hermes.cadence.agents'))
-  const [scope, setScope] = useDeviceScope(storedScope())
+  const [scope, setScope, epoch] = useDeviceScope(storedScope())
   const report = useQuery({
-    queryKey: ['cadence', 'summary', scope],
+    queryKey: ['cadence', 'summary', scope, epoch],
     queryFn: () => activity(['summary', ...scopeArgs(scope)]),
     staleTime: 180000
   })
