@@ -31,6 +31,9 @@ function parseCli(output) {
 }
 
 async function activity(argv) {
+  if (typeof globalThis.__cadenceActivityImpl === 'function') {
+    return globalThis.__cadenceActivityImpl(argv)
+  }
   const args = ['cadence', ...argv, '--json']
   let response
   if (typeof host.requestProfile === 'function' && typeof host.profileRoutes === 'function') {
@@ -244,6 +247,65 @@ function saveView(key, value) {
   try { localStorage.setItem(key, value) } catch { /* the toggle still works for this visit */ }
 }
 
+const SCOPE_KEY = 'hermes.cadence.scope'
+const SCOPES = [['all', 'All profiles'], ['profile', 'This profile']]
+const SCOPE_EVENT = 'hermes.cadence.scope-change'
+
+let scopeEpoch = 0
+
+function bumpScopeEpoch(scope) {
+  scopeEpoch += 1
+  try {
+    window.dispatchEvent(new CustomEvent(SCOPE_EVENT, { detail: { epoch: scopeEpoch, scope } }))
+  } catch {
+    /* ignore */
+  }
+}
+
+// null follows plugins.entries.cadence.settings.scope; a click pins a choice on this device.
+function storedScope() {
+  try {
+    const value = localStorage.getItem(SCOPE_KEY)
+    return SCOPES.some(([id]) => id === value) ? value : null
+  } catch {
+    return null
+  }
+}
+
+function useDeviceScope(initial) {
+  const [scope, setScopeState] = useState(initial)
+  const [epoch, setEpoch] = useState(scopeEpoch)
+  useEffect(() => {
+    const sync = event => {
+      const chosen = event?.detail?.scope
+      if (chosen !== undefined && SCOPES.some(([id]) => id === chosen)) {
+        setScopeState(chosen)
+      } else {
+        setScopeState(storedScope())
+      }
+      setEpoch(scopeEpoch)
+    }
+    const onStorage = event => {
+      if (event.key === SCOPE_KEY || event.key === null) sync(event)
+    }
+    window.addEventListener('storage', onStorage)
+    window.addEventListener(SCOPE_EVENT, sync)
+    return () => {
+      window.removeEventListener('storage', onStorage)
+      window.removeEventListener(SCOPE_EVENT, sync)
+    }
+  }, [])
+  const setScope = next => {
+    setScopeState(next)
+    bumpScopeEpoch(next)
+  }
+  return [scope, setScope, epoch]
+}
+
+function scopeArgs(scope) {
+  return scope ? ['--scope', scope] : []
+}
+
 function topRows(rows, limit) {
   if (rows.length <= limit) return rows
   const rest = rows.slice(limit)
@@ -427,6 +489,17 @@ function sourceRows(sources) {
   }))
 }
 
+function profileRows(profiles) {
+  const total = profiles.reduce((sum, row) => sum + (Number(row.tokens) || 0), 0) || 1
+  return profiles.map(row => ({
+    key: row.profile,
+    label: row.profile,
+    sub: `${row.sessions} sessions`,
+    value: Number(row.tokens) || 0,
+    display: `${compact(row.tokens)} · ${Math.round(((Number(row.tokens) || 0) / total) * 100)}%`
+  }))
+}
+
 function localDay(daysAgo) {
   const date = new Date()
   date.setDate(date.getDate() - daysAgo)
@@ -441,14 +514,16 @@ function ActivityPage() {
   const [selected, setSelected] = useState(null)
   const [modelView, setModelView] = useState(() => storedView('hermes.activity.models'))
   const [placeView, setPlaceView] = useState(() => storedView('hermes.activity.places'))
+  const [agentView, setAgentView] = useState(() => storedView('hermes.cadence.agents'))
+  const [scope, setScope, epoch] = useDeviceScope(storedScope())
   const report = useQuery({
-    queryKey: ['cadence', 'summary'],
-    queryFn: () => activity(['summary']),
+    queryKey: ['cadence', 'summary', scope, epoch],
+    queryFn: () => activity(['summary', ...scopeArgs(scope)]),
     staleTime: 180000
   })
   const detail = useQuery({
-    queryKey: ['activity-board', 'day', selected],
-    queryFn: () => activity(['day', selected]),
+    queryKey: ['activity-board', 'day', selected, scope],
+    queryFn: () => activity(['day', selected, ...scopeArgs(scope)]),
     enabled: Boolean(selected)
   })
   if (report.isLoading) {
@@ -460,7 +535,27 @@ function ActivityPage() {
       children: [
         jsx('div', { className: 'text-foreground', children: 'Activity could not load' }),
         jsx('div', { className: 'text-(--ui-text-tertiary)', children: report.error.message }),
-        jsx(Button, { size: 'xs', variant: 'text', onClick: () => void report.refetch(), children: 'Retry' })
+        jsxs('div', {
+          className: 'flex flex-wrap items-center gap-3',
+          children: [
+            jsx(Button, { size: 'xs', variant: 'text', onClick: () => void report.refetch(), children: 'Retry' }),
+            jsx('div', {
+              className: 'flex gap-3 text-[0.72rem]',
+              children: SCOPES.map(([id, label]) => jsx('button', {
+                type: 'button',
+                className: id === (scope || 'all') ? 'text-foreground' : 'text-(--ui-text-tertiary)',
+                onClick: () => { saveView(SCOPE_KEY, id); setScope(id) },
+                children: label
+              }, id))
+            })
+          ]
+        }),
+        scope !== 'profile' ? jsx(Button, {
+          size: 'xs',
+          variant: 'text',
+          onClick: () => { saveView(SCOPE_KEY, 'profile'); setScope('profile') },
+          children: 'Show this profile only'
+        }) : null
       ]
     })
   }
@@ -486,13 +581,24 @@ function ActivityPage() {
               jsx('h1', { className: 'text-[1.05rem] font-medium text-foreground', children: 'Cadence' }),
               jsx('p', {
                 className: 'text-[0.72rem] text-(--ui-text-tertiary)',
-                children: 'Days you used Hermes. A continued chat counts on the day it continued.'
+                children: data.scope === 'all'
+                  ? `Days you used Hermes across ${(data.included_profiles || []).length} profiles. A continued chat counts on the day it continued.`
+                  : 'Days you used Hermes. A continued chat counts on the day it continued.'
               })
             ]
           }),
           jsx('div', {
             className: 'flex items-center gap-3',
             children: [
+              jsx('div', {
+                className: 'flex gap-3 text-[0.72rem]',
+                children: SCOPES.map(([id, label]) => jsx('button', {
+                  type: 'button',
+                  className: id === (data.scope || 'profile') ? 'text-foreground' : 'text-(--ui-text-tertiary)',
+                  onClick: () => { saveView(SCOPE_KEY, id); setScope(id); setSelected(null) },
+                  children: label
+                }, id))
+              }),
               jsx('div', {
                 className: 'flex gap-3 text-[0.72rem]',
                 children: [['30', '30 days'], ['90', '90 days'], ['all', 'All time']].map(([id, label]) => jsx('button', {
@@ -558,7 +664,10 @@ function ActivityPage() {
               className: 'flex items-center justify-between gap-3 text-[0.72rem]',
               children: [
                 jsx('span', { className: 'min-w-0 truncate text-foreground', children: session.title }),
-                jsx('span', { className: 'shrink-0 text-(--ui-text-tertiary)', children: `${session.source} · ${compact(session.tokens)}` })
+                jsx('span', {
+                  className: 'shrink-0 text-(--ui-text-tertiary)',
+                  children: [session.profile, session.source, compact(session.tokens)].filter(Boolean).join(' · ')
+                })
               ]
             }, session.id))
           })
@@ -582,7 +691,15 @@ function ActivityPage() {
             view: placeView,
             onView: next => { setPlaceView(next); saveView('hermes.activity.places', next) },
             nameLabel: 'Place'
-          })
+          }),
+          data.scope === 'all' ? jsx(Breakdown, {
+            title: 'Agents',
+            rows: profileRows((data.spans ? span.profiles : data.profiles) || []),
+            empty: 'No agent sessions yet.',
+            view: agentView,
+            onView: next => { setAgentView(next); saveView('hermes.cadence.agents', next) },
+            nameLabel: 'Profile'
+          }) : null
         ]
       })
     ]
@@ -590,9 +707,10 @@ function ActivityPage() {
 }
 
 function StatusChip() {
+  const [scope, , epoch] = useDeviceScope(storedScope())
   const report = useQuery({
-    queryKey: ['cadence', 'summary'],
-    queryFn: () => activity(['summary']),
+    queryKey: ['cadence', 'summary', scope, epoch],
+    queryFn: () => activity(['summary', ...scopeArgs(scope)]),
     staleTime: 180000
   })
   const current = report.data?.streaks?.current
@@ -604,7 +722,7 @@ function StatusChip() {
   })
 }
 
-export default {
+const cadencePlugin = {
   id: ID,
   name: 'Cadence',
   register(ctx) {
@@ -628,3 +746,13 @@ export default {
     ctx.register({ id: 'statusbar', area: STATUSBAR_AREAS.right, order: 120, render: () => jsx(StatusChip, {}) })
   }
 }
+
+export default cadencePlugin
+
+const _harness =
+  typeof process !== 'undefined' &&
+  process.env &&
+  process.env.CADENCE_TEST_HARNESS === '1'
+export const __cadenceHarness = _harness
+  ? { ActivityPage, StatusChip, SCOPE_KEY, storedScope, scopeArgs }
+  : undefined
