@@ -96,6 +96,9 @@ globalThis.__cadenceActivityImpl = async argv => {
   return minimalSummary(s === 'all' ? 'all' : 'profile')
 }
 
+const sdkUrl = pathToFileURL(join(__dirname, 'stubs', 'plugin-sdk', 'index.js')).href
+const { clearQueryCache } = await import(sdkUrl)
+
 const pluginUrl = pathToFileURL(pluginPath).href + '?t=' + Date.now()
 const mod = await import(pluginUrl)
 const harness = mod.__cadenceHarness
@@ -145,6 +148,41 @@ await waitFor(() => {
   screen.getByText('9 day streak')
 })
 assert(localStorage.getItem(SCOPE_KEY) === 'all', 'scope should persist as all')
+
+// --- Test 3: late page mount shares summary cache with mounted badge after scope bump ---
+document.body.innerHTML = '<div id="p"></div><div id="c"></div>'
+localStorage.clear()
+activityCalls = []
+clearQueryCache()
+const pageMount = render(h(ActivityPage), { container: document.getElementById('p') })
+await waitFor(() => {
+  screen.getByRole('heading', { name: 'Cadence' })
+})
+const beforeBump = activityCalls.filter(args => args[0] === 'summary').length
+const allBtn = [...document.getElementById('p').querySelectorAll('button')].find(b => b.textContent === 'All profiles')
+fireEvent.click(allBtn)
+await waitFor(() => {
+  assert(
+    activityCalls.filter(args => args[0] === 'summary' && parseScope(args) === 'all').length >= 1,
+    'expected summary for all profiles after switch'
+  )
+})
+const afterBump = activityCalls.filter(args => args[0] === 'summary').length
+pageMount.unmount()
+document.body.innerHTML = '<div id="c"></div>'
+render(h(StatusChip), { container: document.getElementById('c') })
+await waitFor(() => {
+  screen.getByText('9 day streak')
+})
+const withChipOnly = activityCalls.filter(args => args[0] === 'summary').length
+document.body.insertAdjacentHTML('afterbegin', '<div id="p"></div>')
+render(h(ActivityPage), { container: document.getElementById('p') })
+await waitFor(() => {
+  screen.getByRole('heading', { name: 'Cadence' })
+})
+const afterPageRemount = activityCalls.filter(args => args[0] === 'summary').length
+assert(afterPageRemount === withChipOnly, `page remount should not refetch summary (got ${afterPageRemount}, was ${withChipOnly})`)
+assert(afterBump > beforeBump, 'scope switch should have refreshed summary at least once')
 
 console.log('cadence desktop harness: ok')
 console.log('activity call patterns (sample):', JSON.stringify(activityCalls.slice(0, 12)))

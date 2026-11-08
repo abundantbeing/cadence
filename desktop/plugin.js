@@ -274,7 +274,7 @@ function storedScope() {
 
 function useDeviceScope(initial) {
   const [scope, setScopeState] = useState(initial)
-  const [epoch, setEpoch] = useState(0)
+  const [epoch, setEpoch] = useState(scopeEpoch)
   useEffect(() => {
     const sync = event => {
       const chosen = event?.detail?.scope

@@ -15,7 +15,13 @@ export function Skeleton(props) {
   return createElement('div', { 'data-testid': 'skeleton', ...props })
 }
 
-export function useQuery({ queryKey, queryFn, enabled = true }) {
+const queryCache = new Map()
+
+export function clearQueryCache() {
+  queryCache.clear()
+}
+
+export function useQuery({ queryKey, queryFn, enabled = true, staleTime = 0 }) {
   const [state, setState] = useState({
     isLoading: Boolean(enabled),
     error: null,
@@ -27,11 +33,19 @@ export function useQuery({ queryKey, queryFn, enabled = true }) {
       setState({ isLoading: false, error: null, data: undefined })
       return undefined
     }
+    const cached = queryCache.get(key)
+    if (cached && (!staleTime || Date.now() - cached.at < staleTime)) {
+      setState({ isLoading: false, error: null, data: cached.data })
+      return undefined
+    }
     let cancelled = false
     setState({ isLoading: true, error: null, data: undefined })
     Promise.resolve(queryFn())
       .then(data => {
-        if (!cancelled) setState({ isLoading: false, error: null, data })
+        if (!cancelled) {
+          queryCache.set(key, { data, at: Date.now() })
+          setState({ isLoading: false, error: null, data })
+        }
       })
       .catch(error => {
         if (!cancelled) setState({ isLoading: false, error, data: undefined })
