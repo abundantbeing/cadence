@@ -149,11 +149,15 @@ await waitFor(() => {
 })
 assert(localStorage.getItem(SCOPE_KEY) === 'all', 'scope should persist as all')
 
-// --- Test 3: late page mount shares summary cache with mounted badge after scope bump ---
-document.body.innerHTML = '<div id="p"></div><div id="c"></div>'
+// --- Test 3: chip stays mounted across scope bump; late page mount must not refetch ---
+document.body.innerHTML = '<div id="c"></div><div id="p"></div>'
 localStorage.clear()
 activityCalls = []
 clearQueryCache()
+render(h(StatusChip), { container: document.getElementById('c') })
+await waitFor(() => {
+  screen.getByText('2 day streak')
+})
 const pageMount = render(h(ActivityPage), { container: document.getElementById('p') })
 await waitFor(() => {
   screen.getByRole('heading', { name: 'Cadence' })
@@ -162,27 +166,24 @@ const beforeBump = activityCalls.filter(args => args[0] === 'summary').length
 const allBtn = [...document.getElementById('p').querySelectorAll('button')].find(b => b.textContent === 'All profiles')
 fireEvent.click(allBtn)
 await waitFor(() => {
-  assert(
-    activityCalls.filter(args => args[0] === 'summary' && parseScope(args) === 'all').length >= 1,
-    'expected summary for all profiles after switch'
-  )
-})
-const afterBump = activityCalls.filter(args => args[0] === 'summary').length
-pageMount.unmount()
-document.body.innerHTML = '<div id="c"></div>'
-render(h(StatusChip), { container: document.getElementById('c') })
-await waitFor(() => {
   screen.getByText('9 day streak')
 })
+const afterBump = activityCalls.filter(args => args[0] === 'summary').length
+assert(afterBump > beforeBump, 'scope switch should have refreshed summary at least once')
+pageMount.unmount()
 const withChipOnly = activityCalls.filter(args => args[0] === 'summary').length
-document.body.insertAdjacentHTML('afterbegin', '<div id="p"></div>')
-render(h(ActivityPage), { container: document.getElementById('p') })
+const latePage = document.createElement('div')
+latePage.id = 'p-late'
+document.body.appendChild(latePage)
+render(h(ActivityPage), { container: latePage })
 await waitFor(() => {
   screen.getByRole('heading', { name: 'Cadence' })
 })
-const afterPageRemount = activityCalls.filter(args => args[0] === 'summary').length
-assert(afterPageRemount === withChipOnly, `page remount should not refetch summary (got ${afterPageRemount}, was ${withChipOnly})`)
-assert(afterBump > beforeBump, 'scope switch should have refreshed summary at least once')
+const afterLatePageMount = activityCalls.filter(args => args[0] === 'summary').length
+assert(
+  afterLatePageMount === withChipOnly,
+  `late page mount should not refetch summary (got ${afterLatePageMount}, was ${withChipOnly})`
+)
 
 console.log('cadence desktop harness: ok')
 console.log('activity call patterns (sample):', JSON.stringify(activityCalls.slice(0, 12)))
