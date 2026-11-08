@@ -757,6 +757,15 @@ def _models(conn: sqlite3.Connection, usage_cols: set[str], session_cols: set[st
     return sorted(rows, key=lambda item: item["tokens"], reverse=True)
 
 
+def _message_timestamp_sort_sql(column: str = "m.timestamp") -> str:
+    ceiling = _EPOCH_SECOND_MAX
+    return (
+        f"CASE WHEN {column} > {ceiling * 1000} THEN NULL "
+        f"WHEN {column} > {ceiling} THEN {column} / 1000.0 "
+        f"ELSE {column} END"
+    )
+
+
 def _longest_stretch(conn: sqlite3.Connection, params: tuple) -> Optional[dict[str, Any]]:
     personal = _personal_where()
     best: Optional[dict[str, Any]] = None
@@ -764,6 +773,7 @@ def _longest_stretch(conn: sqlite3.Connection, params: tuple) -> Optional[dict[s
     title = source = None
     cluster_start = cluster_end = None
     previous = None
+    sort_key = _message_timestamp_sort_sql()
 
     def consider() -> None:
         nonlocal best
@@ -782,35 +792,36 @@ def _longest_stretch(conn: sqlite3.Connection, params: tuple) -> Optional[dict[s
                 "source": source or "unknown",
             }
 
-    query = conn.execute(
-        f"""SELECT s.id, s.title, s.source, m.timestamp
-            FROM messages m
-            JOIN sessions s ON s.id = m.session_id
-            LEFT JOIN sessions p ON p.id = s.parent_session_id
-            WHERE m.timestamp IS NOT NULL AND {personal}""",
-        params,
-    )
-    rows = []
-    for row in query:
-        stamp = _normalize_unix_seconds(float(row["timestamp"]))
-        if stamp is None:
-            continue
-        rows.append((row["id"], row["title"], row["source"], stamp))
-    rows.sort(key=lambda item: (item[0], item[3]))
-    for session_id, title_val, source_val, stamp in rows:
-        row = {"id": session_id, "title": title_val, "source": source_val, "timestamp": stamp}
-        if row["id"] != current_id:
-            consider()
-            current_id = row["id"]
-            title = row["title"]
-            source = row["source"]
-            cluster_start = cluster_end = previous = stamp
-            continue
-        if previous is not None and stamp - previous > STRETCH_GAP_SECONDS:
-            consider()
-            cluster_start = stamp
-        cluster_end = stamp
-        previous = stamp
+    session_sql = f"""SELECT DISTINCT s.id, s.title, s.source
+                      FROM messages m
+                      JOIN sessions s ON s.id = m.session_id
+                      LEFT JOIN sessions p ON p.id = s.parent_session_id
+                      WHERE m.timestamp IS NOT NULL AND {personal}
+                      ORDER BY s.id"""
+    message_sql = f"""SELECT m.timestamp
+                      FROM messages m
+                      JOIN sessions s ON s.id = m.session_id
+                      LEFT JOIN sessions p ON p.id = s.parent_session_id
+                      WHERE m.timestamp IS NOT NULL AND {personal} AND s.id = ?
+                      ORDER BY {sort_key}"""
+    for session in conn.execute(session_sql, params):
+        consider()
+        current_id = session["id"]
+        title = session["title"]
+        source = session["source"]
+        cluster_start = cluster_end = previous = None
+        for row in conn.execute(message_sql, (*params, current_id)):
+            stamp = _normalize_unix_seconds(float(row["timestamp"]))
+            if stamp is None:
+                continue
+            if cluster_start is None:
+                cluster_start = cluster_end = previous = stamp
+                continue
+            if stamp - previous > STRETCH_GAP_SECONDS:
+                consider()
+                cluster_start = stamp
+            cluster_end = stamp
+            previous = stamp
     consider()
     return best
 
